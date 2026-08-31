@@ -1,0 +1,135 @@
+<!-- ================= BLOXSTAR PATCH v55 — standalone backend bridge =================
+     The storefront now talks to the BloxStar Node/PostgreSQL backend that is
+     deployed alongside it on Vercel (same origin, /api/public/*). No Lovable,
+     Supabase or PostgREST runtime dependency remains.
+
+     This layer:
+       1) translates the legacy PostgREST-shaped order calls to the new API,
+       2) keeps MoonPay as the only customer payment provider,
+       3) never trusts client-side price / paid / admin values — the server
+          recomputes prices, stock and payment state.
+================================================================================ -->
+<script id="bs55-backend-bridge">
+(function(){
+  var API = (window.BS_API_BASE || '') + '/api/public/orders';
+
+  function tok(){ try{ var s=(typeof bsSession==='function')?bsSession():null; return s&&s.token?s.token:'' }catch(e){ return '' } }
+  function isAdm(){ try{ var s=(typeof bsSession==='function')?bsSession():null; return !!(s&&s.admin) }catch(e){ return false } }
+
+  function headers(){
+    var h={'Content-Type':'application/json'};
+    var t=tok(); if(t)h['authorization']='Bearer '+t;
+    return h;
+  }
+  function jsonResponse(obj,status){
+    return new Response(JSON.stringify(obj),{status:status||200,headers:{'Content-Type':'application/json'}});
+  }
+  function lines(items){
+    return (items||[]).map(function(i){ return {id:i.id,q:+i.q||1} })
+                      .filter(function(i){ return i.id!=null });
+  }
+  /* Rebuild the row shape the existing UI code expects from an API order. */
+  function row(o){
+    var data={
+      code:o.code, email:o.email, user:o.robloxUser||'', game:o.game||'mm2',
+      items:(o.items||[]).map(function(i){ return {id:i.id,n:i.name,q:i.q,p:i.price} }),
+      subtotal:o.subtotal, fee:o.fee, total:o.total,
+      pay:'Visa / Card (MoonPay)', status:o.status, paid:!!o.paid,
+      stockDeducted:true, claimed:o.status==='delivered', date:o.createdAt
+    };
+    return {code:o.code,status:o.status,data:data,created_at:o.createdAt};
+  }
+
+  function actionFor(status){
+    if(/^(confirmed|paid|delivered|complete[d]?)$/i.test(status||''))return 'confirm';
+    if(/^(cancel|cancelled|canceled|refunded|deleted)$/i.test(status||''))return 'cancel';
+    return null;
+  }
+
+  var real = window.fetch.bind(window);
+
+  window.fetch = function(input, init){
+    var url = (typeof input === 'string') ? input : (input && input.url) || '';
+    if(url.indexOf(API) !== 0) return real(input, init);
+
+    init = init || {};
+    var method = (init.method || 'GET').toUpperCase();
+    var qs = url.slice(API.length);
+    var payload = null;
+    try{ payload = init.body ? JSON.parse(init.body) : null; }catch(e){ payload = null; }
+
+    /* ---- reads -------------------------------------------------------- */
+    if(method === 'GET'){
+      if(!tok()) return Promise.resolve(jsonResponse([]));   /* signed out: nothing to sync */
+      var q = isAdm() ? '?all=1' : '';
+      return real(API + q, {headers: headers()})
+        .then(function(r){ return r.ok ? r.json() : {orders:[]} })
+        .then(function(j){ return jsonResponse((j.orders||[]).map(row)); })
+        .catch(function(){ return jsonResponse([]); });
+    }
+
+    /* ---- creates and RPC calls ---------------------------------------- */
+    if(method === 'POST'){
+      var intent = payload && (payload.p_intent || payload.data || payload);
+
+      /* admin_transition_order RPC */
+      if(payload && payload.p_code){
+        var act = actionFor(payload.p_next);
+        if(!act) return Promise.resolve(jsonResponse({ok:false},400));
+        return real(API, {method:'PATCH',headers:headers(),
+          body:JSON.stringify({code:payload.p_code, action:act})})
+          .then(function(r){ return r.json().catch(function(){return{}}).then(function(j){
+            return jsonResponse(j.ok ? {code:payload.p_code} : {ok:false}, r.status);
+          })});
+      }
+
+      if(!intent) return Promise.resolve(jsonResponse({ok:false,error:'invalid'},400));
+      var body = {
+        intentId: intent.intentId || intent.id || intent.code || ('MP-' + Date.now()),
+        items: lines(intent.items),
+        user: intent.user || '',
+        game: intent.game || 'mm2'
+      };
+      return real(API, {method:'POST',headers:headers(),body:JSON.stringify(body)})
+        .then(function(r){ return r.json().catch(function(){return{}}).then(function(j){
+          if(j && j.ok && j.order) return jsonResponse([{code:j.order.code}], 201);
+          return jsonResponse({ok:false,error:(j&&j.error)||'create_failed'}, r.status||400);
+        })});
+    }
+
+    /* ---- status changes ------------------------------------------------ */
+    if(method === 'PATCH' || method === 'DELETE'){
+      var m = /code=eq\.([^&]+)/.exec(qs);
+      if(!m) return Promise.resolve(jsonResponse({ok:true}));
+      var code = decodeURIComponent(m[1]);
+      var action = method === 'DELETE' ? 'cancel' : actionFor(payload && payload.status);
+      if(!action) return Promise.resolve(jsonResponse({ok:true}));  /* nothing the server allows */
+      return real(API, {method:'PATCH',headers:headers(),body:JSON.stringify({code:code,action:action})});
+    }
+
+    return real(input, init);
+  };
+
+  /* ---- MoonPay is the only customer payment provider ------------------- */
+  function toMoonPay(){
+    try{
+      var amt = (typeof total === 'function') ? total() : 0;
+      if(typeof processMoonPayPayment === 'function') return processMoonPayPayment(amt);
+    }catch(e){}
+  }
+  window.startTransak = toMoonPay;
+  window.startNowPayments = toMoonPay;
+  window.fetchTransakWidgetUrl = function(){ return Promise.reject(new Error('provider_disabled')); };
+  setInterval(function(){
+    if(window.startTransak !== toMoonPay) window.startTransak = toMoonPay;
+    if(window.startNowPayments !== toMoonPay) window.startNowPayments = toMoonPay;
+  }, 2000);
+
+  /* Payment list: no Transak / NOWPayments entries reach the customer. */
+  try{
+    if(Array.isArray(window.PAYMENTS)){
+      window.PAYMENTS.forEach(function(p){ if(p && p.np) delete p.np; });
+    }
+  }catch(e){}
+})();
+</script>
